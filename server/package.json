@@ -1,0 +1,16 @@
+{
+  "name": "video-sync-vlc-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WebSocket relay server for synchronizing VLC playback between computers.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22 <25"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
