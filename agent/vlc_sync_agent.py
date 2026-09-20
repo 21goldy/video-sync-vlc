@@ -9,7 +9,7 @@ Design:
 - Clients estimate server clock offset with NTP-style ping/pong.
 - Playback position is NOT continuously forced by heartbeats.
 - Drift is corrected gently with VLC playback-rate changes.
-- A hard seek is used only for large drift and only with a cooldown.
+- Explicit seek events are authoritative; background drift correction uses playback rate only.
 - Local UI actions are the only authoritative commands; remote commands are
   marked as remote so they never echo back into the room.
 """
@@ -37,7 +37,7 @@ from tkinter import filedialog, messagebox, ttk
 import websocket
 
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 DEFAULT_SERVER = "wss://video-sync-vlc.onrender.com"
 VLC_HOST = "127.0.0.1"
 VLC_PORT = 8081
@@ -147,6 +147,26 @@ class VLCController:
 
     def command(self, command, **params):
         return self._request(command, **params)
+
+    def publish_sync_point(self, position, playing, rate=1.0):
+        """Sync peers to the current VLC point without re-seeking local VLC."""
+        st=self.vlc.status()
+        if not st.get("connected"):
+            return
+        position=max(0.0, float(position))
+        rate=float(rate or 1.0)
+        self._set_local_shared(position, playing, rate, now_ms()+COMMAND_DELAY_MS)
+        self.local_expected_until=time.time()+2.0
+        self.last_user_action=time.time()
+        self.send({
+            "type":"command",
+            "commandId":str(uuid.uuid4()),
+            "action":"seek",
+            "position":position,
+            "rate":rate,
+            "mediaKey":media_key(self.vlc.media_path) if self.vlc.media_path else None,
+            "mediaName":self.vlc.media_path.name if self.vlc.media_path else None,
+        })
 
     def play(self):
         return self.command("pl_forceresume")
@@ -309,6 +329,8 @@ class SyncClient:
 
         self.last_local = None
         self.last_user_action = 0.0
+        self.native_seek_candidate = None
+        self.native_seek_last_change = 0.0
 
     def connect(self, url):
         if self.connected or self.connecting:
@@ -536,39 +558,67 @@ class SyncClient:
 
         current = float(st.get("time", 0) or 0)
         current_rate = float(st.get("rate", 1) or 1)
-        current_state = st.get("state")
         if position is None:
             position = current
+        position = max(0.0, float(position))
+        chosen_rate = float(rate if rate is not None else current_rate)
 
-        # Execute the local action FIRST. The local machine must never wait for
-        # the network to control its own VLC instance.
+        # The local computer is authoritative for the action it just made.
+        # Update our shared model immediately as well as executing VLC locally.
+        # This is important for Sync Now and native VLC seeks: otherwise the
+        # periodic drift loop still sees the OLD shared position (often 0:00)
+        # and can pull VLC straight back to it.
+        at_server_ms = now_ms() + COMMAND_DELAY_MS
         if action == "play":
-            self.vlc.rate(float(rate if rate is not None else current_rate))
+            self.vlc.rate(chosen_rate)
             self.vlc.play()
+            self._set_local_shared(position, True, chosen_rate, at_server_ms)
         elif action == "pause":
+            # Read the position again immediately before publishing pause so
+            # the pause event contains the actual VLC pause point.
+            pause_st = self.vlc.status()
+            position = float(pause_st.get("time", position) or position)
             self.vlc.pause()
+            self._set_local_shared(position, False, chosen_rate, at_server_ms)
         elif action == "seek":
-            self.vlc.seek(float(position))
+            self.vlc.seek(position)
+            self._set_local_shared(position, bool(st.get("state") == "playing"), chosen_rate, at_server_ms)
         elif action == "restart":
+            position = 0.0
             self.vlc.seek(0)
             self.vlc.rate(1.0)
             self.vlc.play()
+            self._set_local_shared(0.0, True, 1.0, at_server_ms)
+            chosen_rate = 1.0
         elif action == "rate":
-            self.vlc.rate(float(rate if rate is not None else current_rate))
+            self.vlc.rate(chosen_rate)
+            self._set_local_shared(position, bool(st.get("state") == "playing"), chosen_rate, at_server_ms)
 
-        # Give VLC a moment to accept the local command, but don't block the UI.
         payload = {
             "type": "command",
             "commandId": str(uuid.uuid4()),
             "action": action,
-            "position": max(0.0, float(position)),
-            "rate": float(rate if rate is not None else current_rate),
+            "position": position,
+            "rate": chosen_rate,
             "mediaKey": media_key(self.vlc.media_path) if self.vlc.media_path else None,
             "mediaName": self.vlc.media_path.name if self.vlc.media_path else None,
         }
         self.last_user_action = time.time()
-        self.local_expected_until = time.time() + 1.5
+        # Give the native VLC operation time to settle before drift correction
+        # is allowed to touch it.
+        self.local_expected_until = time.time() + 2.0
         self.send(payload)
+
+    def _set_local_shared(self, position, playing, rate, at_server_ms=None):
+        """Immediately make a local user action authoritative in our model."""
+        if at_server_ms is None:
+            at_server_ms = now_ms() + COMMAND_DELAY_MS
+        self.shared.update({
+            "position": max(0.0, float(position)),
+            "playing": bool(playing),
+            "rate": float(rate),
+            "atServerMs": int(at_server_ms),
+        })
 
     def play(self):
         self.send_action("play")
@@ -634,7 +684,7 @@ class SyncClient:
         self.ui_update(status=st, sync_ms=self.current_sync_ms(st))
 
     def _detect_native_vlc_action(self, st):
-        """Mirror direct VLC play/pause/seek actions without echoing remote commands."""
+        """Detect direct VLC GUI play/pause/seek actions and publish them once."""
         t = time.time()
         current = float(st.get("time", 0) or 0)
         state = st.get("state")
@@ -648,27 +698,37 @@ class SyncClient:
         dt = max(0.0, t - lt)
         expected = lp + (dt * lr if ls == "playing" else 0.0)
         position_jump = abs(current - expected)
-        state_changed = state != ls
-
-        # VLC's own seek bar is also a valid user control. Normal playback
-        # changes position by only ~POLL_MS worth of video between samples;
-        # a materially larger jump means the user dragged the VLC timeline.
-        # Use a low threshold so even short manual seeks are propagated.
         normal_step = abs(dt * max(0.25, abs(lr)))
-        native_seek = position_jump > max(0.8, normal_step * 3.0 + 0.25)
+        native_seek = position_jump > max(0.55, normal_step * 2.5 + 0.15)
 
-        # Remote commands and our own correction operations are ignored during
-        # the short settling window. After that, a human using VLC directly
-        # can still control the shared session.
-        if t >= self.local_expected_until:
-            if state_changed:
+        # During our own command/remote-command settling window, do not turn
+        # the resulting VLC status changes into a second command.
+        if t < self.local_expected_until:
+            self.native_seek_candidate = None
+            self.last_local = (t, current, state, rate)
+            return
+
+        if native_seek:
+            # Dragging VLC's seek bar produces several transient HTTP status
+            # samples. Wait briefly for the position to become stable, then
+            # publish exactly one seek. This prevents the sync loop from
+            # fighting the native VLC seek while the user is still dragging.
+            if (self.native_seek_candidate is None or
+                    abs(current - self.native_seek_candidate) > 0.35):
+                self.native_seek_candidate = current
+                self.native_seek_last_change = t
+            elif t - self.native_seek_last_change >= 0.30:
+                target = float(self.native_seek_candidate)
+                self.native_seek_candidate = None
+                self.log(f"Native VLC seek detected at {format_time(target)}; syncing peer.")
+                self.send_action("seek", position=target)
+        else:
+            self.native_seek_candidate = None
+            if state != ls:
                 if state == "playing":
                     self.send_action("play", position=current)
                 elif state == "paused":
                     self.send_action("pause", position=current)
-            elif native_seek:
-                self.log(f"Native VLC seek detected at {format_time(current)}; syncing peer.")
-                self.send_action("seek", position=current)
 
         self.last_local = (t, current, state, rate)
 
@@ -686,9 +746,7 @@ class SyncClient:
         return max(0.0, p + elapsed * float(self.shared.get("rate",1) or 1))
 
     def _smooth_sync(self, st):
-        # Deliberately conservative: synchronization must never make VLC jump
-        # around. Playback commands/seek events are authoritative; drift is only
-        # corrected gently and infrequently.
+        """Correct clock drift gently without ever fighting an explicit seek."""
         if not self.peer_connected or time.time() < self.local_expected_until:
             return
         if not self.shared.get("mediaKey") or not self.vlc.media_path:
@@ -696,33 +754,27 @@ class SyncClient:
         if self.shared.get("mediaKey") != media_key(self.vlc.media_path):
             return
 
+        # Explicit play/pause/seek/restart events are authoritative. Once an
+        # event has landed, only tiny playback-rate corrections are allowed.
+        # There are deliberately NO periodic hard seeks here. Hard seeks were
+        # the source of the repeated "jump back" behaviour during native VLC
+        # dragging and Sync Now.
         target = self.predicted_shared_position()
         local = float(st.get("time", 0) or 0)
         drift = target - local
         abs_drift = abs(drift)
 
+        current = float(st.get("rate", 1) or 1)
         if abs_drift < SMALL_DRIFT:
-            current = float(st.get("rate", 1) or 1)
             if abs(current - 1.0) > 0.003:
                 self.vlc.rate(1.0)
             return
 
-        # Do not seek for ordinary drift. A single seek is reserved for a real
-        # desynchronization and is heavily rate-limited.
-        if abs_drift >= LARGE_DRIFT and time.time() - self.last_hard_seek >= HARD_SEEK_COOLDOWN:
-            self.last_hard_seek = time.time()
-            self.local_expected_until = time.time() + 1.5
-            self.log(f"Large drift {drift:+.2f}s; performing one sync seek.")
-            self.vlc.pause()
-            self.vlc.seek(target)
-            if self.shared.get("playing"):
-                self.vlc.play()
+        if not self.shared.get("playing") or st.get("state") != "playing":
             return
 
-        # For smaller drift, adjust rate by at most +/-2% for a short period.
         correction = clamp(drift * 0.025, -MAX_RATE_ADJUST, MAX_RATE_ADJUST)
         desired = clamp(1.0 + correction, 0.98, 1.02)
-        current = float(st.get("rate", 1) or 1)
         if abs(current - desired) > 0.003:
             self.vlc.rate(desired)
 
@@ -918,11 +970,18 @@ class App:
             self.client.seek(self.position_var.get())
 
     def sync_now(self):
-        # Treat current local position as an explicit shared seek.
+        # Publish the CURRENT VLC position as the authoritative sync point.
+        # Do not issue a redundant local seek: that can race VLC's own status
+        # update and was the reason Sync Now could jump back to 00:00.
         st=self.client.vlc.status()
-        if st.get("connected"):
-            self.client.seek(float(st.get("time",0)))
-            self.log("Manual sync point sent.")
+        if not st.get("connected") or st.get("length",0) <= 0:
+            self.log("Sync Now: no active video in VLC.")
+            return
+        position=float(st.get("time",0) or 0)
+        playing=(st.get("state") == "playing")
+        rate=float(st.get("rate",1) or 1)
+        self.client.publish_sync_point(position, playing, rate)
+        self.log(f"Manual sync point sent: {format_time(position)}")
 
     def ui_update(self, **kwargs):
         # Called from worker/websocket threads; marshal all Tk changes to main thread.
