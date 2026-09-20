@@ -37,7 +37,7 @@ from tkinter import filedialog, messagebox, ttk
 import websocket
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.5.0"
 DEFAULT_SERVER = "wss://video-sync-vlc.onrender.com"
 VLC_HOST = "127.0.0.1"
 VLC_PORT = 8081
@@ -650,6 +650,13 @@ class SyncClient:
         position_jump = abs(current - expected)
         state_changed = state != ls
 
+        # VLC's own seek bar is also a valid user control. Normal playback
+        # changes position by only ~POLL_MS worth of video between samples;
+        # a materially larger jump means the user dragged the VLC timeline.
+        # Use a low threshold so even short manual seeks are propagated.
+        normal_step = abs(dt * max(0.25, abs(lr)))
+        native_seek = position_jump > max(0.8, normal_step * 3.0 + 0.25)
+
         # Remote commands and our own correction operations are ignored during
         # the short settling window. After that, a human using VLC directly
         # can still control the shared session.
@@ -659,7 +666,8 @@ class SyncClient:
                     self.send_action("play", position=current)
                 elif state == "paused":
                     self.send_action("pause", position=current)
-            elif position_jump > 3.0:
+            elif native_seek:
+                self.log(f"Native VLC seek detected at {format_time(current)}; syncing peer.")
                 self.send_action("seek", position=current)
 
         self.last_local = (t, current, state, rate)
