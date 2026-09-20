@@ -1,1206 +1,815 @@
 #!/usr/bin/env python3
 """
-Video Sync - VLC Edition
+Video Sync VLC v3
+Event-driven, bidirectional VLC synchronization.
 
-Cross-platform desktop agent that:
-- starts VLC with its HTTP control interface when needed
-- reads VLC playback status
-- sends play/pause/seek/rate state through a public WSS relay
-- applies remote state with latency compensation
-- gradually corrects small playback drift
-- keeps VLC's HTTP interface bound to localhost
-
-Tested design target: VLC 3.x, Python 3.10+.
+Design:
+- Both computers are peers; either can Play/Pause/Seek/Restart.
+- The server orders commands and assigns a shared execution time.
+- Clients estimate server clock offset with NTP-style ping/pong.
+- Playback position is NOT continuously forced by heartbeats.
+- Drift is corrected gently with VLC playback-rate changes.
+- A hard seek is used only for large drift and only with a cooldown.
+- Local UI actions are the only authoritative commands; remote commands are
+  marked as remote so they never echo back into the room.
 """
-
-from __future__ import annotations
-
 import base64
 import hashlib
-import math
 import json
 import os
 import platform
 import queue
-import shutil
+import random
 import subprocess
 import sys
 import threading
 import time
-import urllib.parse
-import urllib.request
 import uuid
 from pathlib import Path
+from urllib.parse import quote
+
+import requests
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-
-try:
-    import requests
-except ImportError:
-    requests = None
-
-try:
-    import websocket
-except ImportError:
-    websocket = None
+import websocket
 
 
-APP_NAME = "Video Sync - VLC Edition"
+APP_VERSION = "3.0.0"
 DEFAULT_SERVER = "wss://video-sync-vlc.onrender.com"
-DEFAULT_HTTP_HOST = "127.0.0.1"
-DEFAULT_HTTP_PORT = 8081
-DEFAULT_HTTP_PASSWORD = "video-sync-local"
+VLC_HOST = "127.0.0.1"
+VLC_PORT = 8081
+VLC_PASSWORD = "video-sync-local"
 
-POLL_INTERVAL = 0.20
+POLL_MS = 250
+CLOCK_INTERVAL = 2.0
+DRIFT_INTERVAL = 0.75
+SMALL_DRIFT = 0.12       # seconds
+LARGE_DRIFT = 3.00       # seconds
+HARD_SEEK_COOLDOWN = 8.0
+MAX_RATE_ADJUST = 0.035  # +/-3.5%
+COMMAND_DELAY_MS = 250
 
-def safe_float(value, fallback=0.0):
-    try:
-        n = float(value)
-        return n if math.isfinite(n) else fallback
-    except (TypeError, ValueError):
-        return fallback
-
-def safe_rate(value):
-    return max(0.05, min(8.0, safe_float(value, 1.0)))
-
-CLOCK_INTERVAL = 5.0
-SYNC_DEBOUNCE = 0.12
-
-SMALL_DRIFT = 0.080
-MEDIUM_DRIFT = 0.250
-LARGE_DRIFT = 0.800
-
-RATE_MIN = 0.985
-RATE_MAX = 1.015
-
-APP_DIR = Path.home() / ".video-sync-vlc"
-CONFIG_PATH = APP_DIR / "config.json"
-
-
-def now_ms() -> int:
+def now_ms():
     return int(time.time() * 1000)
 
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-def make_room_code(length: int = 6) -> str:
-    raw = base64.b32encode(os.urandom(8)).decode("ascii").rstrip("=")
-    return "".join(c for c in raw if c.isalnum())[:length].upper()
-
-
-def normalize_server_url(url: str) -> str:
-    url = url.strip()
-    if url.startswith("https://"):
-        url = "wss://" + url[len("https://"):]
-    elif url.startswith("http://"):
-        url = "ws://" + url[len("http://"):]
-    return url.rstrip("/")
-
-
-def load_config() -> dict:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-
-    defaults = {
-        "server_url": DEFAULT_SERVER,
-        "room": "",
-        "http_host": DEFAULT_HTTP_HOST,
-        "http_port": DEFAULT_HTTP_PORT,
-        "http_password": DEFAULT_HTTP_PASSWORD
-    }
-
-    if not CONFIG_PATH.exists():
-        return defaults
-
+def media_key(path):
+    p = Path(path).resolve()
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        defaults.update(data)
-    except Exception:
-        pass
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    # filename + size is fast and stable across OSes.
+    return f"{p.name.lower()}::{size}"
 
-    return defaults
-
-
-def save_config(data: dict) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        json.dumps(data, indent=2),
-        encoding="utf-8"
-    )
-
-
-def find_vlc() -> str | None:
-    candidates = []
-
-    found = shutil.which("vlc")
-    if found:
-        candidates.append(found)
-
-    system = platform.system()
-
-    if system == "Windows":
-        program_files = os.environ.get("ProgramFiles")
-        program_files_x86 = os.environ.get("ProgramFiles(x86)")
-
-        for base in [program_files, program_files_x86]:
-            if base:
-                candidates.append(
-                    os.path.join(base, "VideoLAN", "VLC", "vlc.exe")
-                )
-
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            candidates.append(
-                os.path.join(local, "Programs", "VideoLAN", "VLC", "vlc.exe")
-            )
-
-    elif system == "Darwin":
-        candidates.append("/Applications/VLC.app/Contents/MacOS/VLC")
-
-    elif system == "Linux":
-        candidates.extend([
-            "/usr/bin/vlc",
-            "/usr/local/bin/vlc",
-            "/snap/bin/vlc"
-        ])
-
-    for path in candidates:
-        if path and Path(path).exists():
-            return path
-
-    return None
+def format_time(seconds):
+    seconds = max(0, int(seconds or 0))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 class VLCController:
-    def __init__(self, host: str, port: int, password: str, log):
-        self.host = host
-        self.port = int(port)
-        self.password = password
+    def __init__(self, log):
         self.log = log
-        self.process: subprocess.Popen | None = None
+        self.process = None
+        self.media_path = None
+        self.base = f"http://{VLC_HOST}:{VLC_PORT}"
+        self.auth = ("", VLC_PASSWORD)
+        self.session = requests.Session()
+        self.session.auth = self.auth
+        self.session.headers.update({"Connection": "close"})
+        self._lock = threading.Lock()
 
-    @property
-    def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
-
-    def _request(self, command: str | None = None, params: dict | None = None):
-        if requests is None:
-            raise RuntimeError(
-                "Python package 'requests' is missing. Run: pip install -r requirements.txt"
-            )
-
-        query = {}
-        if command:
-            query["command"] = command
-
-        if params:
-            query.update(params)
-
-        url = self.base_url + "/requests/status.json"
-        auth = ("", self.password)
-
-        response = requests.get(
-            url,
-            params=query,
-            auth=auth,
-            timeout=1.2
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def status(self) -> dict:
-        return self._request()
-
-    def command(self, command: str, **params):
-        return self._request(command, params)
-
-    def is_reachable(self) -> bool:
+    def _request(self, command, **params):
+        params = {"command": command, **params}
         try:
-            self.status()
-            return True
-        except Exception:
-            return False
-
-    def launch(self, media_path: str | None = None) -> None:
-        if self.is_reachable():
-            if media_path:
-                self.open_media(media_path)
-            return
-
-        vlc_path = find_vlc()
-        if not vlc_path:
-            raise RuntimeError(
-                "VLC was not found. Install VLC from VideoLAN first."
+            r = self.session.get(
+                self.base + "/requests/status.json",
+                params=params,
+                timeout=1.5,
             )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            self.log(f"VLC HTTP error: {e}")
+            return None
 
-        args = [
-            vlc_path,
-            "--extraintf=http",
-            "--http-host", self.host,
-            "--http-port", str(self.port),
-            "--http-password", self.password,
-            "--no-video-title-show",
-        ]
+    def status(self):
+        try:
+            r = self.session.get(
+                self.base + "/requests/status.json",
+                timeout=1.0,
+            )
+            r.raise_for_status()
+            d = r.json()
+            state = str(d.get("state", "stopped"))
+            return {
+                "connected": True,
+                "state": state,
+                "time": float(d.get("time", 0) or 0),
+                "length": float(d.get("length", 0) or 0),
+                "rate": float(d.get("rate", 1) or 1),
+                "position": float(d.get("position", 0) or 0),
+                "filename": self.media_path.name if self.media_path else "",
+            }
+        except Exception:
+            return {"connected": False, "state": "unknown", "time": 0,
+                    "length": 0, "rate": 1, "position": 0, "filename": ""}
 
-        if media_path:
-            args.append(str(Path(media_path).resolve()))
-
-        self.log(f"Starting VLC: {vlc_path}")
-
-        creationflags = 0
-        if platform.system() == "Windows":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-        self.process = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags
-        )
-
-        deadline = time.time() + 8
-
-        while time.time() < deadline:
-            if self.is_reachable():
-                self.log("VLC HTTP interface connected.")
-                return
-            time.sleep(0.2)
-
-        raise RuntimeError(
-            "VLC started, but its local HTTP interface did not respond."
-        )
-
-    def open_media(self, media_path: str) -> None:
-        # Send the decoded local filesystem path. requests will URL-encode the
-        # query exactly once, and VLC's HTTP interface converts the decoded
-        # input into a media URI. Pre-encoding with Path.as_uri() causes
-        # spaces such as %20 to become %2520 on the wire.
-        resolved = Path(media_path).resolve()
-        if platform.system() == "Windows":
-            input_value = resolved.as_posix()
-        else:
-            input_value = str(resolved)
-        self.command("in_play", input=input_value)
+    def command(self, command, **params):
+        return self._request(command, **params)
 
     def play(self):
-        return self.command("pl_play")
+        return self.command("pl_forceresume")
 
     def pause(self):
         return self.command("pl_forcepause")
 
-    def stop(self):
-        return self.command("pl_stop")
+    def seek(self, seconds):
+        return self.command("seek", val=str(max(0.0, float(seconds))))
 
-    def seek(self, seconds: float):
-        return self.command("seek", val=f"{max(0.0, seconds):.3f}")
+    def rate(self, value):
+        value = clamp(float(value), 0.10, 4.0)
+        return self.command("rate", val=f"{value:.5f}")
 
-    def set_rate(self, rate: float):
-        return self.command("rate", val=f"{max(0.05, rate):.4f}")
+    def open_media(self, path):
+        p = Path(path).resolve()
+        self.media_path = p
+        # VLC's HTTP API expects a decoded input; requests performs query
+        # encoding once. Do not pre-encode spaces as %20.
+        value = p.as_posix() if platform.system() == "Windows" else str(p)
+        return self.command("in_play", input=value)
+
+    def find_vlc(self):
+        system = platform.system()
+        candidates = []
+        if system == "Windows":
+            candidates = [
+                os.environ.get("ProgramFiles", r"C:\Program Files") + r"\VideoLAN\VLC\vlc.exe",
+                os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)") + r"\VideoLAN\VLC\vlc.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Programs\VLC\vlc.exe"),
+            ]
+            for c in candidates:
+                if c and os.path.exists(c):
+                    return c
+            return "vlc.exe"
+        if system == "Darwin":
+            return "/Applications/VLC.app/Contents/MacOS/VLC"
+        return "vlc"
+
+    def start(self, path=None):
+        if self.status().get("connected"):
+            if path:
+                self.open_media(path)
+            return True
+
+        exe = self.find_vlc()
+        args = [
+            exe,
+            "--extraintf=http",
+            "--http-host", VLC_HOST,
+            "--http-port", str(VLC_PORT),
+            "--http-password", VLC_PASSWORD,
+            "--no-video-title-show",
+            "--no-http-host-interface",
+        ]
+        if path:
+            args.append(str(Path(path).resolve()))
+
+        try:
+            creationflags = 0
+            if platform.system() == "Windows":
+                creationflags = subprocess.CREATE_NO_WINDOW
+            self.process = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except Exception as e:
+            self.log(f"Could not start VLC: {e}")
+            return False
+
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if self.status().get("connected"):
+                self.log("VLC HTTP interface connected.")
+                if path:
+                    self.media_path = Path(path).resolve()
+                return True
+            time.sleep(0.2)
+        self.log("VLC started, but HTTP interface was not reachable.")
+        return False
 
 
 class SyncClient:
-    def __init__(self, ui_queue: queue.Queue, log):
-        self.ui_queue = ui_queue
-        self.log = log
+    def __init__(self, ui_log, ui_update):
+        self.log = ui_log
+        self.ui_update = ui_update
         self.ws = None
-        self.thread = None
-        self.running = False
-        self.room = None
-        self.role = None
+        self.ws_thread = None
+        self.stop_event = threading.Event()
         self.connected = False
+        self.room = ""
+        self.role = ""
+        self.client_id = ""
+        self.peer_connected = False
+
         self.clock_offset_ms = 0.0
-        self.last_ping_sent = 0
+        self.rtt_ms = 0.0
+        self.last_clock = 0.0
 
-    def _emit(self, event: str, data=None):
-        self.ui_queue.put((event, data))
+        self.last_seq = 0
+        self.shared = {
+            "mediaKey": None,
+            "mediaName": None,
+            "position": 0.0,
+            "playing": False,
+            "rate": 1.0,
+            "atServerMs": now_ms(),
+            "seq": 0,
+        }
 
-    def connect(self, server_url: str):
-        if websocket is None:
-            raise RuntimeError(
-                "Python package 'websocket-client' is missing. "
-                "Run: pip install -r requirements.txt"
-            )
+        self.pending_commands = {}
+        self.executed_ids = set()
+        self.last_hard_seek = 0.0
+        self.local_expected_until = 0.0
+        self.local_expected_state = None
+        self.last_rate_set = 1.0
+        self.vlc = VLCController(ui_log)
 
-        server_url = normalize_server_url(server_url)
+        self.last_local = None
+        self.last_user_action = 0.0
 
-        if not server_url.startswith(("ws://", "wss://")):
-            raise ValueError("Server URL must start with ws:// or wss://")
-
-        self.disconnect()
-
-        self.running = True
-
-        def run():
-            while self.running:
-                try:
-                    self.log(f"Connecting to {server_url}")
-                    self.ws = websocket.create_connection(
-                        server_url,
-                        timeout=5,
-                        enable_multithread=True
-                    )
-
-                    self.connected = True
-                    self._emit("connected", None)
-                    self.log("Connected to sync server.")
-
-                    while self.running:
-                        try:
-                            raw = self.ws.recv()
-                            if raw is None:
-                                break
-
-                            message = json.loads(raw)
-                            self._handle(message)
-
-                        except websocket.WebSocketTimeoutException:
-                            continue
-                        except Exception as exc:
-                            if self.running:
-                                self.log(f"WebSocket receive error: {exc}")
-                            break
-
-                except Exception as exc:
-                    if self.running:
-                        self.log(f"Connection failed: {exc}")
-                        self._emit("connection-error", str(exc))
-
-                finally:
-                    self.connected = False
-                    self._emit("disconnected", None)
-
-                    try:
-                        if self.ws:
-                            self.ws.close()
-                    except Exception:
-                        pass
-
-                    self.ws = None
-
-                if self.running:
-                    time.sleep(2)
-
-        self.thread = threading.Thread(
-            target=run,
-            name="sync-websocket",
-            daemon=True
+    def connect(self, url):
+        if self.connected:
+            return
+        self.stop_event.clear()
+        self.ws_thread = threading.Thread(
+            target=self._run_ws, args=(url,), daemon=True
         )
-        self.thread.start()
+        self.ws_thread.start()
+
+    def _run_ws(self, url):
+        try:
+            self.ws = websocket.create_connection(
+                url,
+                timeout=5,
+                enable_multithread=True,
+            )
+            self.connected = True
+            self.log("Connected to sync server.")
+            self.send({"type": "hello"})
+            self._send_clock_ping()
+
+            while not self.stop_event.is_set():
+                try:
+                    raw = self.ws.recv()
+                    if raw is None:
+                        break
+                    self.handle_message(json.loads(raw))
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as e:
+                    if not self.stop_event.is_set():
+                        self.log(f"WebSocket error: {e}")
+                    break
+        except Exception as e:
+            self.log(f"Connection failed: {e}")
+        finally:
+            self.connected = False
+            self.peer_connected = False
+            self.ui_update()
+            try:
+                if self.ws:
+                    self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+    def send(self, obj):
+        if not self.ws or not self.connected:
+            return False
+        try:
+            self.ws.send(json.dumps(obj, separators=(",", ":")))
+            return True
+        except Exception as e:
+            self.log(f"Send failed: {e}")
+            return False
+
+    def _send_clock_ping(self):
+        self.last_clock = time.time()
+        self.send({
+            "type": "clock_ping",
+            "pingId": str(uuid.uuid4()),
+            "clientWallMs": now_ms(),
+        })
+
+    def handle_message(self, m):
+        t = m.get("type")
+        if t == "clock_pong":
+            sent = self.last_clock
+            rtt = max(0.0, time.time() - sent)
+            server_ms = float(m.get("serverMs", now_ms()))
+            midpoint = now_ms() - (rtt * 1000 / 2)
+            sample = server_ms - midpoint
+            if self.rtt_ms == 0:
+                self.rtt_ms = rtt * 1000
+                self.clock_offset_ms = sample
+            else:
+                alpha = 0.20 if rtt * 1000 < self.rtt_ms * 1.5 else 0.08
+                self.rtt_ms = (1-alpha) * self.rtt_ms + alpha * (rtt*1000)
+                self.clock_offset_ms = (1-alpha) * self.clock_offset_ms + alpha * sample
+            return
+
+        if t in ("created", "joined"):
+            self.room = m["room"]
+            self.role = m["role"]
+            self.client_id = m["clientId"]
+            self.log(f"Room {self.room} joined as {self.role}.")
+            self.ui_update()
+            return
+
+        if t == "peer":
+            self.peer_connected = bool(m.get("connected"))
+            self.ui_update()
+            return
+
+        if t == "media":
+            self.shared["mediaKey"] = m.get("mediaKey")
+            self.shared["mediaName"] = m.get("mediaName")
+            return
+
+        if t == "state":
+            self._accept_state(m)
+            return
+
+        if t == "command":
+            self._accept_command(m)
+            return
+
+        if t == "error":
+            self.log(f"Server: {m.get('code')}: {m.get('message')}")
+            return
+
+    def _accept_state(self, m):
+        seq = int(m.get("seq", 0))
+        if seq < self.last_seq:
+            return
+        self.last_seq = seq
+        self.shared.update({
+            "mediaKey": m.get("mediaKey"),
+            "mediaName": m.get("mediaName"),
+            "position": float(m.get("position", 0) or 0),
+            "playing": bool(m.get("playing")),
+            "rate": float(m.get("rate", 1) or 1),
+            "atServerMs": int(m.get("serverMs", now_ms())),
+            "seq": seq,
+        })
+        self.ui_update()
+
+    def _accept_command(self, m):
+        seq = int(m.get("seq", 0))
+        if seq <= self.last_seq or seq in self.executed_ids:
+            return
+        self.last_seq = seq
+        self.shared.update({
+            "position": float(m.get("position", self.shared["position"]) or 0),
+            "playing": bool(m.get("playing", self.shared["playing"])),
+            "rate": float(m.get("rate", self.shared["rate"]) or 1),
+            "atServerMs": int(m.get("atServerMs", now_ms())),
+            "seq": seq,
+        })
+        command_id = str(m.get("commandId", uuid.uuid4()))
+        self.pending_commands[command_id] = m
+        self._schedule_command(command_id, m)
+        self.ui_update()
+
+    def _schedule_command(self, command_id, m):
+        target_local_ms = int(m.get("atServerMs", now_ms()) - self.clock_offset_ms)
+        delay = max(0, target_local_ms - now_ms())
+        self.ui_update()
+        # Tk scheduling is handled by the main UI thread through callback.
+        self.ui_update(schedule=(delay, command_id, m))
+
+    def execute_command(self, command_id, m):
+        if command_id in self.executed_ids:
+            return
+        self.executed_ids.add(command_id)
+        self.pending_commands.pop(command_id, None)
+
+        action = m.get("action")
+        position = float(m.get("position", 0) or 0)
+        rate = float(m.get("rate", 1) or 1)
+
+        self.local_expected_until = time.time() + 1.2
+        self.local_expected_state = "playing" if action in ("play", "restart") else ("paused" if action == "pause" else None)
+
+        if action == "play":
+            self.vlc.seek(position)
+            self.vlc.rate(rate)
+            self.vlc.play()
+        elif action == "pause":
+            self.vlc.seek(position)
+            self.vlc.pause()
+        elif action == "seek":
+            self.vlc.seek(position)
+        elif action == "restart":
+            self.vlc.seek(0)
+            self.vlc.rate(1)
+            self.vlc.play()
+        elif action == "rate":
+            self.vlc.rate(rate)
+
+    def create_room(self, room):
+        self.send({"type":"create", "room":room, "name":platform.node()})
+
+    def join_room(self, room):
+        self.send({"type":"join", "room":room, "name":platform.node()})
+
+    def leave(self):
+        self.send({"type":"leave"})
+        self.room = ""
+        self.role = ""
+        self.peer_connected = False
+        self.ui_update()
 
     def disconnect(self):
-        self.running = False
-
+        self.stop_event.set()
         try:
             if self.ws:
                 self.ws.close()
         except Exception:
             pass
 
-        self.ws = None
-        self.connected = False
+    def send_action(self, action, position=None, rate=None):
+        st = self.vlc.status()
+        if not st.get("connected"):
+            self.log("VLC is not connected.")
+            return
 
-    def send(self, message: dict) -> bool:
-        if not self.ws or not self.connected:
-            return False
+        if position is None:
+            position = st.get("time", 0.0)
+        # The server schedules commands a few hundred milliseconds in the
+        # future. For actions that preserve the current timeline, predict the
+        # position at that shared execution time instead of seeking backwards.
+        if action in ("play", "pause", "rate") and st.get("state") == "playing":
+            position += (COMMAND_DELAY_MS / 1000.0) * float(st.get("rate", 1) or 1)
 
-        try:
-            self.ws.send(json.dumps(message, allow_nan=False, separators=(",", ":")))
-            return True
-        except Exception as exc:
-            self.log(f"Send error: {exc}")
-            return False
+        payload = {
+            "type":"command",
+            "commandId":str(uuid.uuid4()),
+            "action":action,
+            "position":max(0.0, float(position)),
+            "rate":float(rate if rate is not None else st.get("rate",1)),
+            "mediaKey":media_key(self.vlc.media_path) if self.vlc.media_path else None,
+            "mediaName":self.vlc.media_path.name if self.vlc.media_path else None,
+        }
+        self.last_user_action = time.time()
+        self.send(payload)
 
-    def create_room(self, room: str):
+    def play(self):
+        self.send_action("play")
+
+    def pause(self):
+        self.send_action("pause")
+
+    def restart(self):
+        self.send_action("restart", position=0, rate=1)
+
+    def seek(self, position):
+        self.send_action("seek", position=max(0, position))
+
+    def set_rate(self, rate):
+        self.send_action("rate", rate=rate)
+
+    def open_video(self, path):
+        if not self.vlc.start():
+            return
+        self.vlc.open_media(path)
+        key = media_key(path)
+        self.shared["mediaKey"] = key
+        self.shared["mediaName"] = Path(path).name
         self.send({
-            "type": "create-room",
-            "room": room
+            "type":"media",
+            "mediaKey":key,
+            "mediaName":Path(path).name,
         })
+        self.log(f"Loaded: {Path(path).name}")
 
-    def join_room(self, room: str):
-        self.send({
-            "type": "join-room",
-            "room": room
-        })
+    def tick(self):
+        # periodic clock synchronization
+        if self.connected and time.time() - self.last_clock > CLOCK_INTERVAL:
+            self._send_clock_ping()
 
-    def leave_room(self):
-        self.send({"type": "leave-room"})
-        self.room = None
-        self.role = None
+        st = self.vlc.status()
+        if st.get("connected"):
+            self._detect_native_vlc_action(st)
+            if self.shared.get("seq", 0) > 0:
+                self._smooth_sync(st)
 
-    def send_sync(
-        self,
-        time_seconds: float,
-        playing: bool,
-        rate: float,
-        video_key: str,
-        action: str = "state"
-    ):
-        self.send({
-            "type": "sync",
-            "action": action,
-            "time": float(time_seconds),
-            "playing": bool(playing),
-            "playbackRate": float(rate),
-            "videoKey": video_key
-        })
+        self.ui_update(status=st, sync_ms=self.current_sync_ms(st))
 
-    def send_clock_ping(self):
-        self.last_ping_sent = now_ms()
-        self.send({
-            "type": "clock-ping",
-            "clientTime": self.last_ping_sent
-        })
+    def _detect_native_vlc_action(self, st):
+        """Mirror direct VLC play/pause/seek actions without echoing remote commands."""
+        t = time.time()
+        current = float(st.get("time", 0) or 0)
+        state = st.get("state")
+        rate = float(st.get("rate", 1) or 1)
 
-    def _handle(self, message: dict):
-        message_type = message.get("type")
-
-        if message_type == "connected":
+        if self.last_local is None:
+            self.last_local = (t, current, state, rate)
             return
 
-        if message_type == "room-created":
-            self.room = message.get("room")
-            self.role = message.get("role")
-            self._emit("room", {
-                "room": self.room,
-                "role": self.role
-            })
+        lt, lp, ls, lr = self.last_local
+        dt = max(0.0, t - lt)
+        expected = lp + (dt * lr if ls == "playing" else 0.0)
+        position_jump = abs(current - expected)
+        state_changed = state != ls
+
+        # Remote commands and our own correction operations are ignored during
+        # the short settling window. After that, a human using VLC directly
+        # can still control the shared session.
+        if t >= self.local_expected_until:
+            if state_changed:
+                if state == "playing":
+                    self.send_action("play", position=current)
+                elif state == "paused":
+                    self.send_action("pause", position=current)
+            elif position_jump > 2.0:
+                self.send_action("seek", position=current)
+
+        self.last_local = (t, current, state, rate)
+
+    def current_sync_ms(self, st):
+        if not st.get("connected") or not self.shared.get("mediaKey"):
+            return None
+        target = self.predicted_shared_position()
+        return (float(st.get("time",0)) - target) * 1000
+
+    def predicted_shared_position(self):
+        p = float(self.shared.get("position",0))
+        if not self.shared.get("playing"):
+            return p
+        elapsed = (now_ms() - int(self.shared.get("atServerMs",now_ms()))) / 1000.0
+        return max(0.0, p + elapsed * float(self.shared.get("rate",1) or 1))
+
+    def _smooth_sync(self, st):
+        if not self.peer_connected:
+            return
+        # Never correct immediately after executing an event.
+        if time.time() < self.local_expected_until:
             return
 
-        if message_type == "room-joined":
-            self.room = message.get("room")
-            self.role = message.get("role")
-            self._emit("room", {
-                "room": self.room,
-                "role": self.role
-            })
+        target = self.predicted_shared_position()
+        local = float(st.get("time", 0) or 0)
+        drift = target - local
+        abs_drift = abs(drift)
+
+        if abs_drift < SMALL_DRIFT:
+            # Return rate to normal slowly, but don't issue a VLC command
+            # unless meaningfully different.
+            if abs(float(st.get("rate",1))-1.0) > 0.002:
+                self.vlc.rate(1.0)
             return
 
-        if message_type == "peer-joined":
-            self._emit("peer-joined", None)
+        if abs_drift >= LARGE_DRIFT:
+            if time.time() - self.last_hard_seek >= HARD_SEEK_COOLDOWN:
+                self.last_hard_seek = time.time()
+                self.local_expected_until = time.time() + 1.0
+                self.log(f"Smooth sync: correcting {drift:+.2f}s")
+                self.vlc.seek(target)
             return
 
-        if message_type == "peer-left":
-            self._emit("peer-left", None)
-            return
-
-        if message_type == "session-left":
-            self.room = None
-            self.role = None
-            self._emit("left", None)
-            return
-
-        if message_type == "clock-pong":
-            sent = float(message.get("clientTime", now_ms()))
-            server_time = float(message.get("serverTime", now_ms()))
-            received = now_ms()
-
-            midpoint = (sent + received) / 2.0
-            self.clock_offset_ms = server_time - midpoint
-            self._emit("clock", self.clock_offset_ms)
-            return
-
-        if message_type == "sync":
-            self._emit("remote-sync", message)
-            return
-
-        if message_type == "error":
-            self._emit("server-error", message.get("message", "Unknown error"))
-            return
+        # Proportional rate correction. Max +/-3.5%, so playback remains smooth.
+        correction = clamp(drift * 0.045, -MAX_RATE_ADJUST, MAX_RATE_ADJUST)
+        desired = clamp(1.0 + correction, 0.95, 1.05)
+        current = float(st.get("rate",1) or 1)
+        if abs(current - desired) > 0.004:
+            self.vlc.rate(desired)
 
 
-class VideoSyncApp:
-    def __init__(self, root: tk.Tk):
+class App:
+    def __init__(self, root):
         self.root = root
-        self.root.title(APP_NAME)
-        self.root.geometry("650x690")
-        self.root.minsize(620, 650)
-
-        self.config = load_config()
-        self.events = queue.Queue()
+        self.root.title(f"Video Sync — VLC v{APP_VERSION}")
+        self.root.geometry("760x720")
+        self.root.minsize(680, 620)
 
         self.log_lines = []
-        self.controller = VLCController(
-            self.config["http_host"],
-            self.config["http_port"],
-            self.config["http_password"],
-            self.log
-        )
-        self.sync = SyncClient(self.events, self.log)
+        self.client = SyncClient(self.log, self.ui_update)
+        self.last_status = {}
+        self.slider_dragging = False
+        self._schedule_keys = set()
 
-        self.video_key = ""
-        self.last_local_state = None
-        self.last_sent_state = None
-        self.remote_apply_lock_until = 0.0
-        self.last_remote_sync = 0.0
-        self.last_remote_event_id = ""
-        self.last_sent_at = 0.0
-        self.peer_present = False
-        self.vlc_ok = False
-        self.running = True
+        self._build()
+        self.root.bind("<space>", lambda e: (self.client.pause() if self.last_status.get("state") == "playing" else self.client.play()))
+        self.root.bind("<Left>", lambda e: self.nudge(-10))
+        self.root.bind("<Right>", lambda e: self.nudge(10))
+        self.root.bind("<r>", lambda e: self.client.restart())
+        self.root.after(250, self.loop)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.server_var = tk.StringVar(
-            value=self.config["server_url"]
-        )
-        self.room_var = tk.StringVar(
-            value=self.config.get("room", "")
-        )
-        self.status_var = tk.StringVar(value="Disconnected")
-        self.vlc_status_var = tk.StringVar(value="VLC: Not connected")
-        self.role_var = tk.StringVar(value="No session")
-        self.time_var = tk.StringVar(value="00:00 / 00:00")
-        self.drift_var = tk.StringVar(value="Sync: —")
-        self.file_var = tk.StringVar(value="No media detected")
-        self.peer_var = tk.StringVar(value="Peer: —")
-        self.clock_var = tk.StringVar(value="Clock: —")
+    def _build(self):
+        root = ttk.Frame(self.root, padding=18)
+        root.pack(fill="both", expand=True)
 
-        self._build_ui()
+        title = ttk.Label(root, text="VIDEO SYNC", font=("TkDefaultFont", 24, "bold"))
+        title.pack(anchor="w")
+        ttk.Label(root, text="Smooth bidirectional VLC synchronization",
+                  font=("TkDefaultFont", 11)).pack(anchor="w", pady=(0,14))
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        conn = ttk.LabelFrame(root, text="Connection", padding=10)
+        conn.pack(fill="x", pady=5)
+        self.server_var = tk.StringVar(value=DEFAULT_SERVER)
+        ttk.Entry(conn, textvariable=self.server_var).pack(side="left", fill="x", expand=True)
+        self.connect_btn = ttk.Button(conn, text="Connect", command=self.toggle_connection)
+        self.connect_btn.pack(side="left", padx=(8,0))
 
-        self.root.after(100, self.process_events)
-        self.root.after(200, self.poll_vlc)
-        self.root.after(1000, self.clock_loop)
+        sess = ttk.LabelFrame(root, text="Session", padding=10)
+        sess.pack(fill="x", pady=5)
+        ttk.Label(sess, text="Room").grid(row=0,column=0,sticky="w")
+        self.room_var = tk.StringVar(value="ROOM1")
+        ttk.Entry(sess, textvariable=self.room_var, width=18).grid(row=0,column=1,padx=8)
+        ttk.Button(sess,text="Create",command=self.create_room).grid(row=0,column=2,padx=3)
+        ttk.Button(sess,text="Join",command=self.join_room).grid(row=0,column=3,padx=3)
+        ttk.Button(sess,text="Leave",command=self.leave_room).grid(row=0,column=4,padx=3)
+        self.session_label=ttk.Label(sess,text="Not in a room")
+        self.session_label.grid(row=1,column=0,columnspan=5,sticky="w",pady=(8,0))
 
-    def log(self, message: str):
-        stamp = time.strftime("%H:%M:%S")
-        line = f"[{stamp}] {message}"
-        self.log_lines.append(line)
-        self.log_lines = self.log_lines[-100:]
+        vlc = ttk.LabelFrame(root, text="VLC", padding=10)
+        vlc.pack(fill="x", pady=5)
+        self.vlc_label=ttk.Label(vlc,text="VLC: checking...")
+        self.vlc_label.pack(anchor="w")
+        self.file_label=ttk.Label(vlc,text="No video loaded",wraplength=650)
+        self.file_label.pack(anchor="w",pady=(3,8))
+
+        row=ttk.Frame(vlc); row.pack(fill="x")
+        ttk.Button(row,text="Open / Start VLC",command=self.start_vlc).pack(side="left",padx=(0,6))
+        ttk.Button(row,text="Choose Video",command=self.choose_video).pack(side="left")
+        self.sync_now_btn=ttk.Button(row,text="Sync Now",command=self.sync_now)
+        self.sync_now_btn.pack(side="left",padx=6)
+
+        controls=ttk.Frame(vlc); controls.pack(fill="x",pady=(10,0))
+        ttk.Button(controls,text="▶  Play",command=self.client.play).pack(side="left",fill="x",expand=True,padx=2)
+        ttk.Button(controls,text="Ⅱ  Pause",command=self.client.pause).pack(side="left",fill="x",expand=True,padx=2)
+        ttk.Button(controls,text="↻  Restart",command=self.client.restart).pack(side="left",fill="x",expand=True,padx=2)
+
+        seek=ttk.Frame(vlc); seek.pack(fill="x",pady=(10,0))
+        ttk.Button(seek,text="−10s",command=lambda:self.nudge(-10)).pack(side="left")
+        ttk.Button(seek,text="+10s",command=lambda:self.nudge(10)).pack(side="right")
+        self.position_var=tk.DoubleVar(value=0)
+        self.scale=ttk.Scale(seek,from_=0,to=100,variable=self.position_var,
+                             command=self.slider_move)
+        self.scale.pack(side="left",fill="x",expand=True,padx=8)
+        self.scale.bind("<ButtonRelease-1>", self.slider_release)
+        self.seek_label=ttk.Label(vlc,text="00:00 / 00:00")
+        self.seek_label.pack(anchor="w",pady=(3,0))
+
+        status=ttk.LabelFrame(root,text="Synchronization",padding=10)
+        status.pack(fill="x",pady=5)
+        self.playback_label=ttk.Label(status,text="00:00 / 00:00",font=("TkDefaultFont",18,"bold"))
+        self.playback_label.pack(anchor="w")
+        self.sync_label=ttk.Label(status,text="Sync: —")
+        self.sync_label.pack(anchor="w")
+        self.peer_label=ttk.Label(status,text="Peer: disconnected")
+        self.peer_label.pack(anchor="w")
+        self.clock_label=ttk.Label(status,text="Clock offset: —")
+        self.clock_label.pack(anchor="w")
+        self.mode_label=ttk.Label(status,text="Both computers can control playback")
+        self.mode_label.pack(anchor="w",pady=(4,0))
+
+        logf=ttk.LabelFrame(root,text="Activity",padding=6)
+        logf.pack(fill="both",expand=True,pady=5)
+        self.log_box=tk.Text(logf,height=7,wrap="word",state="disabled")
+        self.log_box.pack(fill="both",expand=True)
+
+    def log(self, text):
+        stamp=time.strftime("%H:%M:%S")
+        self.log_lines.append(f"[{stamp}] {text}")
+        self.log_lines=self.log_lines[-200:]
         try:
-            self.root.after(0, self._refresh_log)
+            self.log_box.configure(state="normal")
+            self.log_box.delete("1.0","end")
+            self.log_box.insert("1.0","\n".join(self.log_lines))
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
         except Exception:
             pass
 
-    def _refresh_log(self):
-        if hasattr(self, "log_text"):
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", "end")
-            self.log_text.insert("end", "\n".join(self.log_lines))
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-
-    def _build_ui(self):
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
-
-        ttk.Label(
-            outer,
-            text="VIDEO SYNC",
-            font=("TkDefaultFont", 18, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(
-            outer,
-            text="Synchronize local VLC playback between two computers",
-        ).pack(anchor="w", pady=(0, 14))
-
-        server_frame = ttk.LabelFrame(
-            outer, text="Connection", padding=12
-        )
-        server_frame.pack(fill="x", pady=5)
-
-        ttk.Label(server_frame, text="Server").grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Entry(
-            server_frame,
-            textvariable=self.server_var
-        ).grid(row=0, column=1, sticky="ew", padx=8)
-
-        self.connect_button = ttk.Button(
-            server_frame,
-            text="Connect",
-            command=self.toggle_server
-        )
-        self.connect_button.grid(row=0, column=2)
-
-        server_frame.columnconfigure(1, weight=1)
-
-        session_frame = ttk.LabelFrame(
-            outer, text="Session", padding=12
-        )
-        session_frame.pack(fill="x", pady=5)
-
-        ttk.Label(session_frame, text="Room").grid(
-            row=0, column=0, sticky="w"
-        )
-
-        ttk.Entry(
-            session_frame,
-            textvariable=self.room_var,
-            width=14
-        ).grid(row=0, column=1, sticky="w", padx=8)
-
-        ttk.Button(
-            session_frame,
-            text="Create",
-            command=self.create_room
-        ).grid(row=0, column=2, padx=3)
-
-        ttk.Button(
-            session_frame,
-            text="Join",
-            command=self.join_room
-        ).grid(row=0, column=3, padx=3)
-
-        ttk.Button(
-            session_frame,
-            text="Leave",
-            command=self.leave_room
-        ).grid(row=0, column=4, padx=3)
-
-        ttk.Label(
-            session_frame,
-            textvariable=self.role_var
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
-
-        vlc_frame = ttk.LabelFrame(
-            outer, text="VLC", padding=12
-        )
-        vlc_frame.pack(fill="x", pady=5)
-
-        ttk.Label(
-            vlc_frame,
-            textvariable=self.vlc_status_var
-        ).pack(anchor="w")
-
-        ttk.Label(
-            vlc_frame,
-            textvariable=self.file_var,
-            wraplength=560
-        ).pack(anchor="w", pady=(4, 8))
-
-        buttons = ttk.Frame(vlc_frame)
-        buttons.pack(fill="x")
-
-        ttk.Button(
-            buttons, text="Open / Start VLC",
-            command=self.open_vlc
-        ).pack(side="left", padx=(0, 5))
-
-        ttk.Button(
-            buttons, text="Choose Video",
-            command=self.choose_video
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            buttons, text="Sync Now",
-            command=lambda: self.send_current_state("manual-sync")
-        ).pack(side="left", padx=5)
-
-        playback_buttons = ttk.Frame(vlc_frame)
-        playback_buttons.pack(fill="x", pady=(10, 0))
-
-        ttk.Button(
-            playback_buttons, text="▶ Play", width=12,
-            command=self.play_video
-        ).pack(side="left", padx=(0, 6))
-
-        ttk.Button(
-            playback_buttons, text="⏸ Pause", width=12,
-            command=self.pause_video
-        ).pack(side="left", padx=6)
-
-        ttk.Button(
-            playback_buttons, text="↻ Restart", width=12,
-            command=self.restart_video
-        ).pack(side="left", padx=6)
-
-        state_frame = ttk.LabelFrame(
-            outer, text="Playback", padding=12
-        )
-        state_frame.pack(fill="x", pady=5)
-
-        ttk.Label(
-            state_frame,
-            textvariable=self.time_var,
-            font=("TkDefaultFont", 14, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(
-            state_frame,
-            textvariable=self.drift_var
-        ).pack(anchor="w", pady=(5, 0))
-
-        ttk.Label(
-            state_frame,
-            textvariable=self.peer_var
-        ).pack(anchor="w", pady=(3, 0))
-
-        ttk.Label(
-            state_frame,
-            textvariable=self.clock_var
-        ).pack(anchor="w", pady=(3, 0))
-
-        log_frame = ttk.LabelFrame(
-            outer, text="Log", padding=8
-        )
-        log_frame.pack(fill="both", expand=True, pady=(5, 0))
-
-        self.log_text = tk.Text(
-            log_frame,
-            height=8,
-            wrap="word",
-            state="disabled"
-        )
-        self.log_text.pack(fill="both", expand=True)
-
-        self.log("Ready.")
-        self.log("Start VLC through this app so its HTTP interface is enabled.")
-
-    def toggle_server(self):
-        if self.sync.running:
-            self.sync.disconnect()
-            self.connect_button.configure(text="Connect")
-            self.status_var.set("Disconnected")
-            return
-
-        try:
-            url = normalize_server_url(self.server_var.get())
-            self.server_var.set(url)
-
-            self.config["server_url"] = url
-            save_config(self.config)
-
-            self.sync.connect(url)
-            self.connect_button.configure(text="Disconnect")
-            self.status_var.set("Connecting...")
-        except Exception as exc:
-            messagebox.showerror("Connection", str(exc))
+    def toggle_connection(self):
+        if self.client.connected:
+            self.client.disconnect()
+            self.connect_btn.config(text="Connect")
+        else:
+            url=self.server_var.get().strip()
+            if not url.startswith(("ws://","wss://")):
+                messagebox.showerror("Server","Enter a ws:// or wss:// address.")
+                return
+            self.client.connect(url)
+            self.connect_btn.config(text="Disconnect")
 
     def create_room(self):
-        if not self.sync.connected:
-            messagebox.showwarning("Not connected", "Connect to the server first.")
-            return
-
-        room = self.room_var.get().strip().upper() or make_room_code()
-        self.room_var.set(room)
-        self.config["room"] = room
-        save_config(self.config)
-        self.sync.create_room(room)
+        room=self.room_var.get().strip()
+        self.client.create_room(room)
 
     def join_room(self):
-        if not self.sync.connected:
-            messagebox.showwarning("Not connected", "Connect to the server first.")
-            return
-
-        room = self.room_var.get().strip().upper()
-        if not room:
-            messagebox.showwarning("Room required", "Enter the room code.")
-            return
-
-        self.config["room"] = room
-        save_config(self.config)
-        self.sync.join_room(room)
+        room=self.room_var.get().strip()
+        self.client.join_room(room)
 
     def leave_room(self):
-        self.sync.leave_room()
-        self.peer_present = False
-        self.role_var.set("No session")
-        self.peer_var.set("Peer: —")
+        self.client.leave()
 
-    def open_vlc(self):
-        try:
-            self.controller.launch()
-            self.vlc_ok = True
-            self.vlc_status_var.set("VLC: Connected")
-        except Exception as exc:
-            self.vlc_ok = False
-            messagebox.showerror(
-                "VLC",
-                f"{exc}\n\nInstall VLC from the official VideoLAN website if needed."
-            )
+    def start_vlc(self):
+        self.client.vlc.start()
 
     def choose_video(self):
-        path = filedialog.askopenfilename(
-            title="Choose local video",
+        path=filedialog.askopenfilename(
+            title="Choose video",
             filetypes=[
-                ("Video files", "*.mkv *.mp4 *.avi *.mov *.webm *.wmv *.m4v *.ts"),
-                ("All files", "*.*")
+                ("Video files","*.mkv *.mp4 *.avi *.mov *.webm *.m4v *.ts"),
+                ("All files","*.*")
             ]
         )
+        if path:
+            self.client.open_video(path)
 
-        if not path:
-            return
+    def nudge(self, delta):
+        st=self.client.vlc.status()
+        if st.get("connected"):
+            self.client.seek(float(st.get("time",0))+delta)
 
+    def slider_move(self, value):
+        self.slider_dragging=True
+        st=self.last_status
+        if st:
+            self.seek_label.config(text=f"{format_time(float(value))} / {format_time(st.get('length',0))}")
+
+    def slider_release(self, _event=None):
+        if self.slider_dragging:
+            self.slider_dragging=False
+            self.client.seek(self.position_var.get())
+
+    def sync_now(self):
+        # Treat current local position as an explicit shared seek.
+        st=self.client.vlc.status()
+        if st.get("connected"):
+            self.client.seek(float(st.get("time",0)))
+            self.log("Manual sync point sent.")
+
+    def ui_update(self, **kwargs):
+        # Called from websocket thread; marshal all Tk changes to main thread.
+        if "schedule" in kwargs:
+            delay, command_id, m = kwargs["schedule"]
+            self.root.after(max(1,int(delay)), lambda cid=command_id,msg=m:self.client.execute_command(cid,msg))
+        # No direct widget updates here; loop() handles them safely.
+
+    def loop(self):
         try:
-            self.controller.launch(path)
-            self.vlc_ok = True
-            self.file_var.set(Path(path).name)
-            self.video_key = self.make_video_key(path)
-            self.vlc_status_var.set("VLC: Connected")
-            self.log(f"Opened: {path}")
-        except Exception as exc:
-            messagebox.showerror("VLC", str(exc))
-
-    def _playback_command(self, action: str):
-        if not self.vlc_ok:
-            messagebox.showwarning("VLC", "Start VLC and open a video first.")
-            return
-
-        try:
-            if action == "play":
-                self.controller.play()
-                self.log("Play pressed.")
-            elif action == "pause":
-                self.controller.pause()
-                self.log("Pause pressed.")
-            elif action == "restart":
-                # Restart means return to 00:00 and start playing.
-                self.controller.seek(0.0)
-                self.controller.play()
-                self.log("Restart pressed.")
+            self.client.tick()
+            st=self.client.vlc.status()
+            self.last_status=st
+            if st.get("connected"):
+                self.vlc_label.config(text="VLC: Connected")
+                name=Path(st.get("filename","")).name if st.get("filename") else (self.client.shared.get("mediaName") or "No video loaded")
+                self.file_label.config(text=name)
+                length=float(st.get("length",0) or 0)
+                current=float(st.get("time",0) or 0)
+                self.playback_label.config(text=f"{format_time(current)} / {format_time(length)}")
+                if not self.slider_dragging:
+                    self.position_var.set(current)
+                    self.seek_label.config(text=f"{format_time(current)} / {format_time(length)}")
             else:
-                return
-
-            # VLC updates its HTTP status asynchronously. Give it a moment,
-            # then immediately publish the new state instead of waiting for
-            # the next polling/heartbeat cycle.
-            self.root.after(250, lambda: self._send_playback_state(action))
-        except Exception as exc:
-            messagebox.showerror("Playback", str(exc))
-            self.log(f"Playback command failed: {exc}")
-
-    def _send_playback_state(self, action: str):
-        try:
-            status = self.controller.status()
-            self.last_local_state = {
-                "time": max(0.0, safe_float(status.get("time"), 0.0)),
-                "length": max(0.0, safe_float(status.get("length"), 0.0)),
-                "playing": str(status.get("state", "stopped")).lower() == "playing",
-                "rate": safe_rate(status.get("rate")),
-                "filename": str(status.get("filename") or "")
-            }
-            self.send_current_state(f"button-{action}")
-        except Exception as exc:
-            self.log(f"Could not send playback state: {exc}")
-
-    def play_video(self):
-        self._playback_command("play")
-
-    def pause_video(self):
-        self._playback_command("pause")
-
-    def restart_video(self):
-        self._playback_command("restart")
-
-    def make_video_key(self, path: str) -> str:
-        # The same video copied to another computer normally has a different
-        # filesystem modification time. Using mtime made valid peers look like
-        # different videos and caused the receiver to silently ignore sync.
-        # Filename + size is stable across machines and is sufficient as a
-        # lightweight identity check for this local two-computer workflow.
-        p = Path(path)
-
-        try:
-            stat = p.stat()
-            sample = f"{p.name.casefold()}|{stat.st_size}"
-        except Exception:
-            sample = p.name.casefold()
-
-        return hashlib.sha256(sample.encode("utf-8")).hexdigest()[:16]
-
-    def poll_vlc(self):
-        if not self.running:
-            return
-
-        try:
-            status = self.controller.status()
-            self.vlc_ok = True
-            self.vlc_status_var.set("VLC: Connected")
-
-            time_seconds = max(0.0, safe_float(status.get("time"), 0.0))
-            length = max(0.0, safe_float(status.get("length"), 0.0))
-            state = str(status.get("state", "stopped")).lower()
-            playing = state == "playing"
-            rate = safe_rate(status.get("rate"))
-
-            info = status.get("information") or {}
-            meta = info.get("meta") or {}
-            filename = (
-                status.get("filename")
-                or meta.get("filename")
-                or meta.get("title")
-                or ""
+                self.vlc_label.config(text="VLC: Not connected")
+            self.session_label.config(
+                text=f"Room: {self.client.room or '—'}    Role: {self.client.role or '—'}"
             )
-
-            if filename:
-                self.file_var.set(str(filename))
-
-            self.time_var.set(
-                f"{self.format_time(time_seconds)} / {self.format_time(length)}"
+            self.peer_label.config(text=f"Peer: {'connected' if self.client.peer_connected else 'disconnected'}")
+            self.clock_label.config(
+                text=f"Clock offset: {self.client.clock_offset_ms:+.0f} ms   RTT: {self.client.rtt_ms:.0f} ms"
             )
+            sync=self.client.current_sync_ms(st)
+            self.sync_label.config(text="Sync: —" if sync is None else f"Sync: {sync:+.0f} ms")
+            self.connect_btn.config(text="Disconnect" if self.client.connected else "Connect")
+        except Exception as e:
+            self.log(f"UI error: {e}")
+        self.root.after(POLL_MS,self.loop)
 
-            current = {
-                "time": time_seconds,
-                "length": length,
-                "playing": playing,
-                "rate": rate,
-                "filename": str(filename)
-            }
-
-            previous = self.last_local_state
-            self.last_local_state = current
-
-            if previous:
-                state_changed = (
-                    previous["playing"] != current["playing"]
-                    or abs(previous["time"] - current["time"]) > 0.75
-                    or abs(previous["rate"] - current["rate"]) > 0.01
-                )
-
-                if state_changed and time.time() >= self.remote_apply_lock_until:
-                    self.send_current_state("local-change")
-
-            if (
-                self.sync.connected
-                and self.sync.room
-                and time.time() - self.last_remote_sync > 1.0
-            ):
-                # Only the master sends periodic authoritative state.
-                # Client devices react to the master's state.
-                if self.sync.role == "master":
-                    self.send_current_state("heartbeat")
-
-        except Exception:
-            self.vlc_ok = False
-            self.vlc_status_var.set("VLC: Not connected")
-
-        self.root.after(int(POLL_INTERVAL * 1000), self.poll_vlc)
-
-    def clock_loop(self):
-        if not self.running:
-            return
-
-        if self.sync.connected:
-            self.sync.send_clock_ping()
-
-        self.root.after(int(CLOCK_INTERVAL * 1000), self.clock_loop)
-
-    def send_current_state(self, action: str):
-        if not self.sync.connected or not self.sync.room:
-            return
-
-        if not self.vlc_ok or not self.last_local_state:
-            return
-
-        state = self.last_local_state
-
-        key = self.video_key
-        if not key and state.get("filename"):
-            key = hashlib.sha256(
-                state["filename"].casefold().encode("utf-8")
-            ).hexdigest()[:16]
-
-        payload_key = key or ""
-        now = time.time()
-
-        current_signature = (
-            round(state["time"], 1),
-            state["playing"],
-            round(state["rate"], 3),
-            payload_key
-        )
-
-        if action == "heartbeat":
-            # One authoritative heartbeat per second is enough.
-            if now - self.last_sent_at < 1.0:
-                return
-
-        self.last_sent_state = current_signature
-        self.last_sent_at = now
-        self.sync.send_sync(
-            time_seconds=state["time"],
-            playing=state["playing"],
-            rate=state["rate"],
-            video_key=payload_key,
-            action=action
-        )
-
-    def apply_remote_sync(self, message: dict):
-        if not self.vlc_ok:
-            return
-
-        remote_time = max(0.0, safe_float(message.get("time"), 0.0))
-        remote_playing = bool(message.get("playing", False))
-        remote_rate = safe_rate(message.get("playbackRate"))
-        sent_at = safe_float(message.get("sentAt"), now_ms())
-
-        # Convert server timestamp to our local clock.
-        estimated_now_server_ms = now_ms() + self.sync.clock_offset_ms
-
-        elapsed = max(
-            0.0,
-            (estimated_now_server_ms - sent_at) / 1000.0
-        )
-
-        target_time = remote_time
-        if remote_playing:
-            target_time += elapsed * remote_rate
-
-        remote_key = str(message.get("videoKey", ""))
-        if remote_key and self.video_key and remote_key != self.video_key:
-            # Do not block synchronization solely on metadata differences.
-            # Files copied between computers can legitimately have different
-            # filesystem metadata. The user has already selected the local
-            # video, so playback state is still safe to synchronize.
-            self.peer_var.set("Peer: connected (video identity differs)")
-
-        try:
-            local = self.controller.status()
-            local_time = max(0.0, safe_float(local.get("time"), 0.0))
-            local_state = str(local.get("state", "")).lower()
-            local_playing = local_state == "playing"
-            local_rate = safe_rate(local.get("rate"))
-
-            drift = target_time - local_time
-            self.drift_var.set(
-                f"Sync: {drift * 1000:+.0f} ms"
-            )
-
-            self.remote_apply_lock_until = time.time() + 0.5
-            self.last_remote_sync = time.time()
-
-            if abs(drift) >= LARGE_DRIFT:
-                self.controller.seek(target_time)
-                self.controller.set_rate(remote_rate)
-
-            elif abs(drift) >= MEDIUM_DRIFT:
-                self.controller.seek(target_time)
-                self.controller.set_rate(remote_rate)
-
-            elif abs(drift) >= SMALL_DRIFT:
-                correction = max(
-                    RATE_MIN,
-                    min(
-                        RATE_MAX,
-                        1.0 + max(-0.015, min(0.015, drift * 0.06))
-                    )
-                )
-
-                if remote_playing:
-                    self.controller.set_rate(correction * remote_rate)
-                else:
-                    self.controller.set_rate(remote_rate)
-
-            else:
-                self.controller.set_rate(remote_rate)
-
-            if remote_playing and not local_playing:
-                self.controller.play()
-            elif not remote_playing and local_playing:
-                self.controller.pause()
-
-            self.peer_var.set(
-                f"Peer: {message.get('sourceRole', 'connected')}"
-            )
-
-        except Exception as exc:
-            self.log(f"Remote apply failed: {exc}")
-
-    def process_events(self):
-        if not self.running:
-            return
-
-        try:
-            while True:
-                event, data = self.events.get_nowait()
-
-                if event == "connected":
-                    self.status_var.set("Connected")
-                    self.connect_button.configure(text="Disconnect")
-
-                elif event == "disconnected":
-                    self.status_var.set("Disconnected")
-                    self.connect_button.configure(text="Connect")
-
-                elif event == "connection-error":
-                    self.status_var.set("Retrying...")
-                    self.log(str(data))
-
-                elif event == "room":
-                    self.room_var.set(data["room"])
-                    self.role_var.set(
-                        f"Room: {data['room']}   Role: {data['role']}"
-                    )
-                    self.log(
-                        f"Session active: {data['room']} ({data['role']})"
-                    )
-
-                elif event == "peer-joined":
-                    self.peer_present = True
-                    self.peer_var.set("Peer: connected")
-                    self.log("Peer joined.")
-
-                    if self.sync.role == "master":
-                        self.send_current_state("initial-sync")
-
-                elif event == "peer-left":
-                    self.peer_present = False
-                    self.peer_var.set("Peer: disconnected")
-                    self.log("Peer left.")
-
-                elif event == "left":
-                    self.role_var.set("No session")
-                    self.peer_var.set("Peer: —")
-
-                elif event == "clock":
-                    self.clock_var.set(
-                        f"Clock offset: {data:+.0f} ms"
-                    )
-
-                elif event == "remote-sync":
-                    # MVP authority remains master -> client. The important
-                    # part is that every received state is applied to the
-                    # client, including play/pause and seeks.
-                    if self.sync.role == "client":
-                        self.apply_remote_sync(data)
-
-                elif event == "server-error":
-                    self.log(f"Server error: {data}")
-
-        except queue.Empty:
-            pass
-
-        self.root.after(100, self.process_events)
-
-    @staticmethod
-    def format_time(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        hours, remainder = divmod(seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-
-        if hours:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-        return f"{minutes:02d}:{secs:02d}"
-
-    def on_close(self):
-        self.running = False
-
-        try:
-            self.sync.leave_room()
-            self.sync.disconnect()
-        except Exception:
-            pass
-
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+    def close(self):
+        self.client.disconnect()
+        self.root.destroy()
 
 
 def main():
-    if sys.version_info < (3, 10):
-        raise SystemExit("Python 3.10 or newer is required.")
-
-    root = tk.Tk()
-    app = VideoSyncApp(root)
+    root=tk.Tk()
+    style=ttk.Style(root)
+    try: style.theme_use("clam")
+    except Exception: pass
+    App(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

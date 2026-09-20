@@ -1,7 +1,4 @@
 {
-  "server_url": "wss://video-sync-vlc-server.onrender.com",
-  "room": "",
-  "http_host": "127.0.0.1",
-  "http_port": 8081,
-  "http_password": "video-sync-local"
+  "server": "wss://video-sync-vlc.onrender.com",
+  "room": "ROOM1"
 }
