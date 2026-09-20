@@ -46,7 +46,7 @@ except ImportError:
 
 
 APP_NAME = "Video Sync - VLC Edition"
-DEFAULT_SERVER = "wss://video-sync-vlc-server.onrender.com"
+DEFAULT_SERVER = "wss://video-sync-vlc.onrender.com"
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8081
 DEFAULT_HTTP_PASSWORD = "video-sync-local"
@@ -268,8 +268,16 @@ class VLCController:
         )
 
     def open_media(self, media_path: str) -> None:
-        uri = Path(media_path).resolve().as_uri()
-        self.command("in_play", input=uri)
+        # Send the decoded local filesystem path. requests will URL-encode the
+        # query exactly once, and VLC's HTTP interface converts the decoded
+        # input into a media URI. Pre-encoding with Path.as_uri() causes
+        # spaces such as %20 to become %2520 on the wire.
+        resolved = Path(media_path).resolve()
+        if platform.system() == "Windows":
+            input_value = resolved.as_posix()
+        else:
+            input_value = str(resolved)
+        self.command("in_play", input=input_value)
 
     def play(self):
         return self.command("pl_play")
@@ -521,6 +529,8 @@ class VideoSyncApp:
         self.last_sent_state = None
         self.remote_apply_lock_until = 0.0
         self.last_remote_sync = 0.0
+        self.last_remote_event_id = ""
+        self.last_sent_at = 0.0
         self.peer_present = False
         self.vlc_ok = False
         self.running = True
@@ -681,6 +691,24 @@ class VideoSyncApp:
             command=lambda: self.send_current_state("manual-sync")
         ).pack(side="left", padx=5)
 
+        playback_buttons = ttk.Frame(vlc_frame)
+        playback_buttons.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(
+            playback_buttons, text="▶ Play", width=12,
+            command=self.play_video
+        ).pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            playback_buttons, text="⏸ Pause", width=12,
+            command=self.pause_video
+        ).pack(side="left", padx=6)
+
+        ttk.Button(
+            playback_buttons, text="↻ Restart", width=12,
+            command=self.restart_video
+        ).pack(side="left", padx=6)
+
         state_frame = ttk.LabelFrame(
             outer, text="Playback", padding=12
         )
@@ -808,14 +836,70 @@ class VideoSyncApp:
         except Exception as exc:
             messagebox.showerror("VLC", str(exc))
 
+    def _playback_command(self, action: str):
+        if not self.vlc_ok:
+            messagebox.showwarning("VLC", "Start VLC and open a video first.")
+            return
+
+        try:
+            if action == "play":
+                self.controller.play()
+                self.log("Play pressed.")
+            elif action == "pause":
+                self.controller.pause()
+                self.log("Pause pressed.")
+            elif action == "restart":
+                # Restart means return to 00:00 and start playing.
+                self.controller.seek(0.0)
+                self.controller.play()
+                self.log("Restart pressed.")
+            else:
+                return
+
+            # VLC updates its HTTP status asynchronously. Give it a moment,
+            # then immediately publish the new state instead of waiting for
+            # the next polling/heartbeat cycle.
+            self.root.after(250, lambda: self._send_playback_state(action))
+        except Exception as exc:
+            messagebox.showerror("Playback", str(exc))
+            self.log(f"Playback command failed: {exc}")
+
+    def _send_playback_state(self, action: str):
+        try:
+            status = self.controller.status()
+            self.last_local_state = {
+                "time": max(0.0, safe_float(status.get("time"), 0.0)),
+                "length": max(0.0, safe_float(status.get("length"), 0.0)),
+                "playing": str(status.get("state", "stopped")).lower() == "playing",
+                "rate": safe_rate(status.get("rate")),
+                "filename": str(status.get("filename") or "")
+            }
+            self.send_current_state(f"button-{action}")
+        except Exception as exc:
+            self.log(f"Could not send playback state: {exc}")
+
+    def play_video(self):
+        self._playback_command("play")
+
+    def pause_video(self):
+        self._playback_command("pause")
+
+    def restart_video(self):
+        self._playback_command("restart")
+
     def make_video_key(self, path: str) -> str:
+        # The same video copied to another computer normally has a different
+        # filesystem modification time. Using mtime made valid peers look like
+        # different videos and caused the receiver to silently ignore sync.
+        # Filename + size is stable across machines and is sufficient as a
+        # lightweight identity check for this local two-computer workflow.
         p = Path(path)
 
         try:
             stat = p.stat()
-            sample = f"{p.name}|{stat.st_size}|{stat.st_mtime_ns}"
+            sample = f"{p.name.casefold()}|{stat.st_size}"
         except Exception:
-            sample = str(p)
+            sample = p.name.casefold()
 
         return hashlib.sha256(sample.encode("utf-8")).hexdigest()[:16]
 
@@ -908,25 +992,26 @@ class VideoSyncApp:
         key = self.video_key
         if not key and state.get("filename"):
             key = hashlib.sha256(
-                state["filename"].encode("utf-8")
+                state["filename"].casefold().encode("utf-8")
             ).hexdigest()[:16]
 
         payload_key = key or ""
+        now = time.time()
 
         current_signature = (
-            round(state["time"], 2),
+            round(state["time"], 1),
             state["playing"],
             round(state["rate"], 3),
             payload_key
         )
 
-        if (
-            action == "heartbeat"
-            and current_signature == self.last_sent_state
-        ):
-            return
+        if action == "heartbeat":
+            # One authoritative heartbeat per second is enough.
+            if now - self.last_sent_at < 1.0:
+                return
 
         self.last_sent_state = current_signature
+        self.last_sent_at = now
         self.sync.send_sync(
             time_seconds=state["time"],
             playing=state["playing"],
@@ -958,8 +1043,11 @@ class VideoSyncApp:
 
         remote_key = str(message.get("videoKey", ""))
         if remote_key and self.video_key and remote_key != self.video_key:
-            self.peer_var.set("Peer: connected, different video key")
-            return
+            # Do not block synchronization solely on metadata differences.
+            # Files copied between computers can legitimately have different
+            # filesystem metadata. The user has already selected the local
+            # video, so playback state is still safe to synchronize.
+            self.peer_var.set("Peer: connected (video identity differs)")
 
         try:
             local = self.controller.status()
@@ -1065,7 +1153,10 @@ class VideoSyncApp:
                     )
 
                 elif event == "remote-sync":
-                    if self.sync.role != "master":
+                    # MVP authority remains master -> client. The important
+                    # part is that every received state is applied to the
+                    # client, including play/pause and seeks.
+                    if self.sync.role == "client":
                         self.apply_remote_sync(data)
 
                 elif event == "server-error":
