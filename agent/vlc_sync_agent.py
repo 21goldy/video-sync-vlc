@@ -21,6 +21,7 @@ import platform
 import queue
 import random
 import subprocess
+from urllib.parse import unquote
 import sys
 import shutil
 import socket
@@ -36,7 +37,7 @@ from tkinter import filedialog, messagebox, ttk
 import websocket
 
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.3.0"
 DEFAULT_SERVER = "wss://video-sync-vlc.onrender.com"
 VLC_HOST = "127.0.0.1"
 VLC_PORT = 8081
@@ -44,12 +45,12 @@ VLC_PASSWORD = "video-sync-local"
 
 POLL_MS = 250
 CLOCK_INTERVAL = 2.0
-DRIFT_INTERVAL = 0.75
-SMALL_DRIFT = 0.12       # seconds
-LARGE_DRIFT = 3.00       # seconds
-HARD_SEEK_COOLDOWN = 8.0
-MAX_RATE_ADJUST = 0.035  # +/-3.5%
-COMMAND_DELAY_MS = 250
+DRIFT_INTERVAL = 1.0
+SMALL_DRIFT = 0.20
+LARGE_DRIFT = 2.50
+HARD_SEEK_COOLDOWN = 12.0
+MAX_RATE_ADJUST = 0.02
+COMMAND_DELAY_MS = 350
 
 def now_ms():
     return int(time.time() * 1000)
@@ -161,12 +162,33 @@ class VLCController:
         return self.command("rate", val=f"{value:.5f}")
 
     def open_media(self, path):
+        """Open a local file through VLC's HTTP API and verify that VLC loaded it.
+
+        We deliberately pass a *decoded* file URI. ``requests`` performs the
+        single URL-encoding step required by VLC's HTTP endpoint. Passing an
+        already percent-encoded URI can result in double-encoding on Windows.
+        """
         p = Path(path).resolve()
         self.media_path = p
-        # VLC's HTTP API expects a decoded input; requests performs query
-        # encoding once. Do not pre-encode spaces as %20.
-        value = p.as_posix() if platform.system() == "Windows" else str(p)
-        return self.command("in_play", input=value)
+        try:
+            value = unquote(p.as_uri())
+        except Exception:
+            value = p.as_posix() if platform.system() == "Windows" else str(p)
+
+        result = self.command("in_play", input=value)
+        if result is None:
+            return None
+
+        # The HTTP request itself can return successfully before VLC has
+        # actually switched the current input. Verify the current item.
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            st = self.status()
+            if st.get("connected") and st.get("length", 0) > 0:
+                return st
+            time.sleep(0.15)
+        self.log("VLC HTTP accepted in_play but no media became active.")
+        return None
 
     def find_vlc(self):
         system = platform.system()
@@ -307,7 +329,6 @@ class SyncClient:
             )
             self.connected = True
             self.log("Connected to sync server.")
-            self.send({"type": "hello"})
             self._send_clock_ping()
 
             while not self.stop_event.is_set():
@@ -447,25 +468,41 @@ class SyncClient:
         self.executed_ids.add(command_id)
         self.pending_commands.pop(command_id, None)
 
-        action = m.get("action")
-        position = float(m.get("position", 0) or 0)
-        rate = float(m.get("rate", 1) or 1)
+        # The sender already executed its own action immediately. Never apply
+        # our own echoed command again.
+        if m.get("sourceId") == self.client_id:
+            return
 
-        self.local_expected_until = time.time() + 1.2
+        action = m.get("action")
+        position = max(0.0, float(m.get("position", 0) or 0))
+        rate = clamp(float(m.get("rate", 1) or 1), 0.5, 2.0)
+
+        remote_key = m.get("mediaKey")
+        local_key = media_key(self.vlc.media_path) if self.vlc.media_path else None
+        if remote_key and local_key and remote_key != local_key:
+            self.log("Remote command ignored: videos do not match.")
+            return
+
+        self.local_expected_until = time.time() + 1.5
         self.local_expected_state = "playing" if action in ("play", "restart") else ("paused" if action == "pause" else None)
 
         if action == "play":
+            # Align once, then play. Do not continuously seek while playing.
             self.vlc.seek(position)
             self.vlc.rate(rate)
             self.vlc.play()
         elif action == "pause":
-            self.vlc.seek(position)
             self.vlc.pause()
+            # A pause should preserve the local timeline; only correct if the
+            # remote event is materially different.
+            local = self.vlc.status().get("time", 0.0)
+            if abs(float(local) - position) > 0.75:
+                self.vlc.seek(position)
         elif action == "seek":
             self.vlc.seek(position)
         elif action == "restart":
             self.vlc.seek(0)
-            self.vlc.rate(1)
+            self.vlc.rate(1.0)
             self.vlc.play()
         elif action == "rate":
             self.vlc.rate(rate)
@@ -497,24 +534,40 @@ class SyncClient:
             self.log("VLC is not connected.")
             return
 
+        current = float(st.get("time", 0) or 0)
+        current_rate = float(st.get("rate", 1) or 1)
+        current_state = st.get("state")
         if position is None:
-            position = st.get("time", 0.0)
-        # The server schedules commands a few hundred milliseconds in the
-        # future. For actions that preserve the current timeline, predict the
-        # position at that shared execution time instead of seeking backwards.
-        if action in ("play", "pause", "rate") and st.get("state") == "playing":
-            position += (COMMAND_DELAY_MS / 1000.0) * float(st.get("rate", 1) or 1)
+            position = current
 
+        # Execute the local action FIRST. The local machine must never wait for
+        # the network to control its own VLC instance.
+        if action == "play":
+            self.vlc.rate(float(rate if rate is not None else current_rate))
+            self.vlc.play()
+        elif action == "pause":
+            self.vlc.pause()
+        elif action == "seek":
+            self.vlc.seek(float(position))
+        elif action == "restart":
+            self.vlc.seek(0)
+            self.vlc.rate(1.0)
+            self.vlc.play()
+        elif action == "rate":
+            self.vlc.rate(float(rate if rate is not None else current_rate))
+
+        # Give VLC a moment to accept the local command, but don't block the UI.
         payload = {
-            "type":"command",
-            "commandId":str(uuid.uuid4()),
-            "action":action,
-            "position":max(0.0, float(position)),
-            "rate":float(rate if rate is not None else st.get("rate",1)),
-            "mediaKey":media_key(self.vlc.media_path) if self.vlc.media_path else None,
-            "mediaName":self.vlc.media_path.name if self.vlc.media_path else None,
+            "type": "command",
+            "commandId": str(uuid.uuid4()),
+            "action": action,
+            "position": max(0.0, float(position)),
+            "rate": float(rate if rate is not None else current_rate),
+            "mediaKey": media_key(self.vlc.media_path) if self.vlc.media_path else None,
+            "mediaName": self.vlc.media_path.name if self.vlc.media_path else None,
         }
         self.last_user_action = time.time()
+        self.local_expected_until = time.time() + 1.5
         self.send(payload)
 
     def play(self):
@@ -535,20 +588,26 @@ class SyncClient:
     def open_video(self, path):
         path = str(Path(path).resolve())
         def worker():
-            if not self.vlc.start():
-                self.ui_update(message="VLC could not be started. See Activity log.")
+            # If VLC is not already running, start it WITH the selected file.
+            # This is more reliable on Windows than starting an empty VLC
+            # instance and then asking the HTTP interface to replace its input.
+            if not self.vlc.start(path):
+                self.ui_update(message="VLC could not open the selected video. Check Activity log.")
                 return
-            result = self.vlc.open_media(path)
-            if result is None:
-                self.log("VLC rejected the selected media.")
-                self.ui_update(message="VLC could not open the selected video.")
-                return
-            deadline = time.time() + 8
+
+            deadline = time.time() + 10
+            st = None
             while time.time() < deadline:
                 st = self.vlc.status()
-                if st.get("connected") and (st.get("length", 0) > 0 or st.get("filename")):
+                if st.get("connected") and st.get("length", 0) > 0:
                     break
                 time.sleep(0.2)
+
+            if not st or st.get("length", 0) <= 0:
+                self.log("VLC HTTP is connected, but the selected media is not active.")
+                self.ui_update(message="VLC opened, but the video is not active. Check VLC/log.")
+                return
+
             key = media_key(path)
             self.shared["mediaKey"] = key
             self.shared["mediaName"] = Path(path).name
@@ -557,7 +616,7 @@ class SyncClient:
                 "mediaKey":key,
                 "mediaName":Path(path).name,
             })
-            self.log(f"Loaded: {Path(path).name}")
+            self.log(f"Loaded: {Path(path).name} ({format_time(st.get('length',0))})")
             self.ui_update(message=f"Loaded: {Path(path).name}")
         threading.Thread(target=worker, daemon=True).start()
 
@@ -600,7 +659,7 @@ class SyncClient:
                     self.send_action("play", position=current)
                 elif state == "paused":
                     self.send_action("pause", position=current)
-            elif position_jump > 2.0:
+            elif position_jump > 3.0:
                 self.send_action("seek", position=current)
 
         self.last_local = (t, current, state, rate)
@@ -619,10 +678,14 @@ class SyncClient:
         return max(0.0, p + elapsed * float(self.shared.get("rate",1) or 1))
 
     def _smooth_sync(self, st):
-        if not self.peer_connected:
+        # Deliberately conservative: synchronization must never make VLC jump
+        # around. Playback commands/seek events are authoritative; drift is only
+        # corrected gently and infrequently.
+        if not self.peer_connected or time.time() < self.local_expected_until:
             return
-        # Never correct immediately after executing an event.
-        if time.time() < self.local_expected_until:
+        if not self.shared.get("mediaKey") or not self.vlc.media_path:
+            return
+        if self.shared.get("mediaKey") != media_key(self.vlc.media_path):
             return
 
         target = self.predicted_shared_position()
@@ -631,25 +694,28 @@ class SyncClient:
         abs_drift = abs(drift)
 
         if abs_drift < SMALL_DRIFT:
-            # Return rate to normal slowly, but don't issue a VLC command
-            # unless meaningfully different.
-            if abs(float(st.get("rate",1))-1.0) > 0.002:
+            current = float(st.get("rate", 1) or 1)
+            if abs(current - 1.0) > 0.003:
                 self.vlc.rate(1.0)
             return
 
-        if abs_drift >= LARGE_DRIFT:
-            if time.time() - self.last_hard_seek >= HARD_SEEK_COOLDOWN:
-                self.last_hard_seek = time.time()
-                self.local_expected_until = time.time() + 1.0
-                self.log(f"Smooth sync: correcting {drift:+.2f}s")
-                self.vlc.seek(target)
+        # Do not seek for ordinary drift. A single seek is reserved for a real
+        # desynchronization and is heavily rate-limited.
+        if abs_drift >= LARGE_DRIFT and time.time() - self.last_hard_seek >= HARD_SEEK_COOLDOWN:
+            self.last_hard_seek = time.time()
+            self.local_expected_until = time.time() + 1.5
+            self.log(f"Large drift {drift:+.2f}s; performing one sync seek.")
+            self.vlc.pause()
+            self.vlc.seek(target)
+            if self.shared.get("playing"):
+                self.vlc.play()
             return
 
-        # Proportional rate correction. Max +/-3.5%, so playback remains smooth.
-        correction = clamp(drift * 0.045, -MAX_RATE_ADJUST, MAX_RATE_ADJUST)
-        desired = clamp(1.0 + correction, 0.95, 1.05)
-        current = float(st.get("rate",1) or 1)
-        if abs(current - desired) > 0.004:
+        # For smaller drift, adjust rate by at most +/-2% for a short period.
+        correction = clamp(drift * 0.025, -MAX_RATE_ADJUST, MAX_RATE_ADJUST)
+        desired = clamp(1.0 + correction, 0.98, 1.02)
+        current = float(st.get("rate", 1) or 1)
+        if abs(current - desired) > 0.003:
             self.vlc.rate(desired)
 
 
@@ -657,8 +723,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Video Sync — VLC v{APP_VERSION}")
-        self.root.geometry("760x720")
-        self.root.minsize(680, 620)
+        self.root.geometry("780x760")
+        self.root.minsize(680, 520)
 
         self.log_lines = []
         self.client = SyncClient(self.log, self.ui_update)
@@ -668,15 +734,44 @@ class App:
 
         self._build()
         self.root.bind("<space>", lambda e: (self.client.pause() if self.last_status.get("state") == "playing" else self.client.play()))
-        self.root.bind("<Left>", lambda e: self.nudge(-10))
-        self.root.bind("<Right>", lambda e: self.nudge(10))
         self.root.bind("<r>", lambda e: self.client.restart())
         self.root.after(250, self.loop)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _build(self):
-        root = ttk.Frame(self.root, padding=18)
-        root.pack(fill="both", expand=True)
+        # Scrollable UI so all controls and Activity log remain reachable on
+        # smaller laptop screens. The window itself never needs to become huge.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        root = ttk.Frame(canvas, padding=18)
+        window_id = canvas.create_window((0, 0), window=root, anchor="nw")
+
+        def update_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def fit_width(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        root.bind("<Configure>", update_scrollregion)
+        canvas.bind("<Configure>", fit_width)
+
+        def wheel(event):
+            # Windows/macOS use delta; Linux commonly supplies button 4/5.
+            if getattr(event, "num", None) == 4:
+                canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", None) == 5:
+                canvas.yview_scroll(3, "units")
+            elif getattr(event, "delta", 0):
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        canvas.bind_all("<MouseWheel>", wheel)
+        canvas.bind_all("<Button-4>", wheel)
+        canvas.bind_all("<Button-5>", wheel)
 
         title = ttk.Label(root, text="VIDEO SYNC", font=("TkDefaultFont", 24, "bold"))
         title.pack(anchor="w")
@@ -720,12 +815,10 @@ class App:
         ttk.Button(controls,text="↻  Restart",command=self.client.restart).pack(side="left",fill="x",expand=True,padx=2)
 
         seek=ttk.Frame(vlc); seek.pack(fill="x",pady=(10,0))
-        ttk.Button(seek,text="−10s",command=lambda:self.nudge(-10)).pack(side="left")
-        ttk.Button(seek,text="+10s",command=lambda:self.nudge(10)).pack(side="right")
         self.position_var=tk.DoubleVar(value=0)
         self.scale=ttk.Scale(seek,from_=0,to=100,variable=self.position_var,
                              command=self.slider_move)
-        self.scale.pack(side="left",fill="x",expand=True,padx=8)
+        self.scale.pack(fill="x",expand=True)
         self.scale.bind("<ButtonRelease-1>", self.slider_release)
         self.seek_label=ttk.Label(vlc,text="00:00 / 00:00")
         self.seek_label.pack(anchor="w",pady=(3,0))
@@ -804,10 +897,6 @@ class App:
         if path:
             self.client.open_video(path)
 
-    def nudge(self, delta):
-        st=self.client.vlc.status()
-        if st.get("connected"):
-            self.client.seek(float(st.get("time",0))+delta)
 
     def slider_move(self, value):
         self.slider_dragging=True

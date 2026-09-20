@@ -155,6 +155,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "hello") {
+      send(ws, {type:"hello", ok:true, serverMs:now()});
+      return;
+    }
+
     if (msg.type === "create") {
       if (!cleanRoom(msg.room)) return error(ws, "INVALID_ROOM", "Invalid room");
       if (rooms.has(msg.room)) return error(ws, "ROOM_EXISTS", "Room already exists");
@@ -246,5 +251,5 @@ setInterval(() => {
 }, 30_000);
 
 server.listen(PORT, HOST, () => {
-  console.log(`Video Sync VLC v3 server listening on ${HOST}:${PORT}`);
+  console.log(`Video Sync VLC v3.4 server listening on ${HOST}:${PORT}`);
 });
