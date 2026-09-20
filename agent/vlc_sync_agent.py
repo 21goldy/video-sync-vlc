@@ -22,6 +22,8 @@ import queue
 import random
 import subprocess
 import sys
+import shutil
+import socket
 import threading
 import time
 import uuid
@@ -76,7 +78,9 @@ class VLCController:
         self.log = log
         self.process = None
         self.media_path = None
-        self.base = f"http://{VLC_HOST}:{VLC_PORT}"
+        self.port = VLC_PORT
+        self.base = f"http://{VLC_HOST}:{self.port}"
+        self.launching = False
         self.auth = ("", VLC_PASSWORD)
         self.session = requests.Session()
         self.session.auth = self.auth
@@ -96,6 +100,27 @@ class VLCController:
         except Exception as e:
             self.log(f"VLC HTTP error: {e}")
             return None
+
+    def _set_port(self, port):
+        self.port = int(port)
+        self.base = f"http://{VLC_HOST}:{self.port}"
+
+    def _port_available(self, port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((VLC_HOST, int(port)))
+                return True
+            except OSError:
+                return False
+
+    def _choose_port(self):
+        if self._port_available(VLC_PORT):
+            return VLC_PORT
+        for port in range(VLC_PORT + 1, VLC_PORT + 20):
+            if self._port_available(port):
+                return port
+        return VLC_PORT
 
     def status(self):
         try:
@@ -161,47 +186,65 @@ class VLCController:
         return "vlc"
 
     def start(self, path=None):
+        # First use an already-running VLC only if its HTTP API is actually reachable.
         if self.status().get("connected"):
             if path:
-                self.open_media(path)
+                result = self.open_media(path)
+                return result is not None
             return True
 
         exe = self.find_vlc()
+        if not (os.path.isabs(exe) and os.path.exists(exe)) and shutil.which(exe) is None:
+            self.log("VLC executable was not found. Install VLC and try again.")
+            return False
+
+        self._set_port(self._choose_port())
         args = [
             exe,
             "--extraintf=http",
             "--http-host", VLC_HOST,
-            "--http-port", str(VLC_PORT),
+            "--http-port", str(self.port),
             "--http-password", VLC_PASSWORD,
             "--no-video-title-show",
-            "--no-http-host-interface",
+            "--no-one-instance",
         ]
         if path:
             args.append(str(Path(path).resolve()))
 
+        self.launching = True
         try:
             creationflags = 0
+            startupinfo = None
             if platform.system() == "Windows":
-                creationflags = subprocess.CREATE_NO_WINDOW
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.process = subprocess.Popen(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
+                startupinfo=startupinfo,
             )
         except Exception as e:
+            self.launching = False
             self.log(f"Could not start VLC: {e}")
             return False
 
-        deadline = time.time() + 8
+        deadline = time.time() + 12
         while time.time() < deadline:
             if self.status().get("connected"):
-                self.log("VLC HTTP interface connected.")
+                self.launching = False
+                self.log(f"VLC HTTP interface connected on port {self.port}.")
                 if path:
                     self.media_path = Path(path).resolve()
                 return True
+            if self.process and self.process.poll() is not None:
+                self.launching = False
+                self.log(f"VLC exited while starting (code {self.process.returncode}).")
+                return False
             time.sleep(0.2)
-        self.log("VLC started, but HTTP interface was not reachable.")
+        self.launching = False
+        self.log(f"VLC did not expose its HTTP interface on 127.0.0.1:{self.port}.")
+        self.log("Try starting VLC once from its normal desktop shortcut, then click Open / Start VLC again.")
         return False
 
 
@@ -213,6 +256,7 @@ class SyncClient:
         self.ws_thread = None
         self.stop_event = threading.Event()
         self.connected = False
+        self.connecting = False
         self.room = ""
         self.role = ""
         self.client_id = ""
@@ -245,9 +289,10 @@ class SyncClient:
         self.last_user_action = 0.0
 
     def connect(self, url):
-        if self.connected:
+        if self.connected or self.connecting:
             return
         self.stop_event.clear()
+        self.connecting = True
         self.ws_thread = threading.Thread(
             target=self._run_ws, args=(url,), daemon=True
         )
@@ -281,6 +326,7 @@ class SyncClient:
             self.log(f"Connection failed: {e}")
         finally:
             self.connected = False
+            self.connecting = False
             self.peer_connected = False
             self.ui_update()
             try:
@@ -487,18 +533,33 @@ class SyncClient:
         self.send_action("rate", rate=rate)
 
     def open_video(self, path):
-        if not self.vlc.start():
-            return
-        self.vlc.open_media(path)
-        key = media_key(path)
-        self.shared["mediaKey"] = key
-        self.shared["mediaName"] = Path(path).name
-        self.send({
-            "type":"media",
-            "mediaKey":key,
-            "mediaName":Path(path).name,
-        })
-        self.log(f"Loaded: {Path(path).name}")
+        path = str(Path(path).resolve())
+        def worker():
+            if not self.vlc.start():
+                self.ui_update(message="VLC could not be started. See Activity log.")
+                return
+            result = self.vlc.open_media(path)
+            if result is None:
+                self.log("VLC rejected the selected media.")
+                self.ui_update(message="VLC could not open the selected video.")
+                return
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                st = self.vlc.status()
+                if st.get("connected") and (st.get("length", 0) > 0 or st.get("filename")):
+                    break
+                time.sleep(0.2)
+            key = media_key(path)
+            self.shared["mediaKey"] = key
+            self.shared["mediaName"] = Path(path).name
+            self.send({
+                "type":"media",
+                "mediaKey":key,
+                "mediaName":Path(path).name,
+            })
+            self.log(f"Loaded: {Path(path).name}")
+            self.ui_update(message=f"Loaded: {Path(path).name}")
+        threading.Thread(target=worker, daemon=True).start()
 
     def tick(self):
         # periodic clock synchronization
@@ -701,16 +762,16 @@ class App:
             pass
 
     def toggle_connection(self):
-        if self.client.connected:
+        if self.client.connected or self.client.connecting:
             self.client.disconnect()
-            self.connect_btn.config(text="Connect")
+            self.connect_btn.config(text="Connect", state="normal")
         else:
             url=self.server_var.get().strip()
             if not url.startswith(("ws://","wss://")):
                 messagebox.showerror("Server","Enter a ws:// or wss:// address.")
                 return
             self.client.connect(url)
-            self.connect_btn.config(text="Disconnect")
+            self.connect_btn.config(text="Connecting…", state="disabled")
 
     def create_room(self):
         room=self.room_var.get().strip()
@@ -724,7 +785,13 @@ class App:
         self.client.leave()
 
     def start_vlc(self):
-        self.client.vlc.start()
+        def worker():
+            ok = self.client.vlc.start()
+            if ok:
+                self.client.log("VLC is ready.")
+            else:
+                self.client.ui_update(message="VLC could not be started. Check Activity log.")
+        threading.Thread(target=worker, daemon=True).start()
 
     def choose_video(self):
         path=filedialog.askopenfilename(
@@ -761,11 +828,13 @@ class App:
             self.log("Manual sync point sent.")
 
     def ui_update(self, **kwargs):
-        # Called from websocket thread; marshal all Tk changes to main thread.
+        # Called from worker/websocket threads; marshal all Tk changes to main thread.
         if "schedule" in kwargs:
             delay, command_id, m = kwargs["schedule"]
             self.root.after(max(1,int(delay)), lambda cid=command_id,msg=m:self.client.execute_command(cid,msg))
-        # No direct widget updates here; loop() handles them safely.
+        if "message" in kwargs:
+            msg = str(kwargs["message"])
+            self.root.after(0, lambda text=msg: messagebox.showinfo("Video Sync", text))
 
     def loop(self):
         try:
@@ -793,7 +862,12 @@ class App:
             )
             sync=self.client.current_sync_ms(st)
             self.sync_label.config(text="Sync: —" if sync is None else f"Sync: {sync:+.0f} ms")
-            self.connect_btn.config(text="Disconnect" if self.client.connected else "Connect")
+            if self.client.connected:
+                self.connect_btn.config(text="Disconnect", state="normal")
+            elif self.client.connecting:
+                self.connect_btn.config(text="Connecting…", state="disabled")
+            else:
+                self.connect_btn.config(text="Connect", state="normal")
         except Exception as e:
             self.log(f"UI error: {e}")
         self.root.after(POLL_MS,self.loop)
